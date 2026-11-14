@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+"""remote-run: run a heavy job on the remote execution host instead of this laptop.
+
+  remote-run submit [opts] -- <command...>   ship a snapshot of this repo, run <command> remotely
+  remote-run wait <job>                      block until the job ends; exit with its exit code
+  remote-run status <job> [--json]           one job's state, elapsed time and peak memory
+  remote-run logs <job> [-n N] [--setup]     tail the job's output
+  remote-run fetch <job> [path...]           copy results to ~/.local/share/remote-run/results/...
+  remote-run cancel <job>                    stop a queued or running job (whole process tree)
+  remote-run host                            lock holder, active jobs, memory, disk, power
+  remote-run list [-n N]                     recent jobs on the host
+  remote-run snapshot -o FILE [--extract DIR]  build the source snapshot without submitting
+  remote-run clean [--days N] [job...]       delete finished job dirs on the host
+
+One heavy job runs on the host at a time (a host-wide lock shared by every agent).
+If `submit` fails, keep the job remote. Check its status if a job id was printed.
+Tool home: the directory above this script (hosts.json, projects/<name>.json, lib/rr_job.py).
+"""
+import argparse
+import fnmatch
+import glob
+import hashlib
+import io
+import json
+import os
+import secrets
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+
+TOOL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+RR_JOB = os.path.join(TOOL_DIR, "lib", "rr_job.py")
+HOSTS_FILE = os.environ.get("REMOTE_RUN_HOSTS_FILE") or os.path.join(TOOL_DIR, "hosts.json")
+PROJECTS_DIR = os.path.join(TOOL_DIR, "projects")
+RESULTS_DIR = os.path.expanduser("~/.local/share/remote-run/results")
+STATE_DIR = os.path.expanduser("~/.local/share/remote-run")
+WAKE_LOG = os.path.join(STATE_DIR, "wake.log")
+HOME = os.path.expanduser("~")
+
+EX_USAGE, EX_UNAVAILABLE, EX_SOFTWARE, EX_BUSY, EX_CONFIG, EX_TIMEOUT = 2, 69, 70, 75, 78, 124
+NO_FALLBACK = ("The job is not running here. Do NOT run it on this laptop instead: retry later, "
+               "re-submit with --queue, or report the failure.")
+ACTIVE = {"starting", "queued", "setup", "running"}
+EXIT_FOR_STATE = {"done": 0, "busy": EX_BUSY, "cancelled": 130, "killed_mem": 137,
+                  "setup_failed": 1, "error": EX_SOFTWARE, "lost": EX_SOFTWARE}
+
+# Excluded from the source tar by path, case-insensitively. --git history is unfiltered.
+DENY_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache",
+             ".mypy_cache", ".ruff_cache", ".remote-run", ".idea", ".vscode",
+             ".planning", ".omc", ".omx", ".claude", ".codex", ".pi", ".omp", ".hermes", ".qwen",
+             ".kimi", ".gemini", ".cursor", ".ssh", ".gnupg", ".aws", ".kube", ".docker"}
+DENY_GLOBS = [".env*", "*.env", ".envrc", "*.pem", "*.key", "*.p12", "*.pfx", "*.p8", "*.jks",
+              "*.keychain", "*.keychain-db", "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*",
+              ".netrc", ".npmrc", ".pypirc", ".pgpass", ".s3cfg", ".htpasswd", ".mcp.json",
+              "*credential*", "*secret*", "*.kdbx", "auth.json", "*.tfstate*", ".ds_store"]
+# External inputs are data files; these locations hold credentials or are cloud-synced.
+DENY_EXTERNAL = [HOME + p for p in ("/.ssh", "/.gnupg", "/.aws", "/.config", "/.kube", "/.docker",
+                                    "/Library", "/Desktop", "/Documents", "/.local/share/remote-run")]
+
+
+def is_private_ip(ip):
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    return a == 10 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31)
+
+
+def say(msg):
+    print("remote-run: " + msg, file=sys.stderr, flush=True)
+
+
+def die(code, msg):
+    say(msg)
+    sys.exit(code)
+
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, text=True, capture_output=True, **kw)
+
+
+class RemoteError(RuntimeError):
+    """A failed ssh/rsync call. rc 255 means the connection itself failed."""
+
+    def __init__(self, msg, rc, stderr=""):
+        super().__init__(msg)
+        self.rc, self.stderr = rc, stderr
+
+
+# ---------------------------------------------------------------- config
+
+def load_hosts():
+    try:
+        with open(HOSTS_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError) as e:
+        die(EX_CONFIG, "cannot read %s: %s" % (HOSTS_FILE, e))
+
+
+def host_config(name):
+    hosts = load_hosts()
+    name = name or os.environ.get("REMOTE_RUN_HOST") or hosts.get("default")
+    if name not in hosts.get("hosts", {}):
+        die(EX_CONFIG, "unknown host %r (known: %s)" % (name, ", ".join(hosts.get("hosts", {}))))
+    h = dict(hosts["hosts"][name])
+    h["name"] = name
+    return h
+
+
+def git(root, *args):
+    r = run(["git", "-C", root] + list(args))
+    if r.returncode:
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout
+
+
+def repo_root(start):
+    try:
+        return os.path.realpath(git(start, "rev-parse", "--show-toplevel").strip())
+    except RuntimeError:
+        die(EX_USAGE, "%s is not inside a git repository (run from the project checkout)" % start)
+
+
+def sanitize(name):
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in name.lower()).strip("-")
+
+
+def project_name(root):
+    """Main-repo name, so every worktree of one repo shares a project config and data cache."""
+    common = git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+    b = os.path.basename(common)
+    if b == ".git":
+        base = os.path.basename(os.path.dirname(common))
+    elif b.endswith(".git"):
+        base = b[:-4]  # bare repo <name>.git
+    else:
+        base = os.path.basename(root)
+    return sanitize(base)
+
+
+def within(path, base):
+    return path == base or path.startswith(base.rstrip("/") + "/")
+
+
+def load_project(root, cwd, explicit):
+    """Config precedence: --config; nearest .remote-run.json from cwd up to the repo root (its
+    directory is the default workdir); a central projects/*.json whose "roots" contain cwd
+    (longest match); central projects/<repo name>.json. None found: run with no inputs."""
+    name = project_name(root)
+    cwd = os.path.realpath(cwd)
+    found, implied_workdir = None, None
+    if explicit:
+        found = os.path.abspath(explicit)
+        if not os.path.exists(found):
+            die(EX_CONFIG, "config %s not found" % explicit)
+    else:
+        d = cwd if within(cwd, root) else root
+        while True:
+            p = os.path.join(d, ".remote-run.json")
+            if os.path.exists(p):
+                found, implied_workdir = p, os.path.relpath(d, root)
+                break
+            if d == root:
+                break
+            d = os.path.dirname(d)
+    if not found:
+        best = -1
+        for p in sorted(glob.glob(os.path.join(PROJECTS_DIR, "*.json"))):
+            with open(p) as f:
+                c = json.load(f)
+            for rt in c.get("roots", []):
+                rt = os.path.realpath(os.path.expanduser(rt))
+                if within(cwd, rt) and len(rt) > best:
+                    found, best = p, len(rt)
+    if not found:
+        p = os.path.join(PROJECTS_DIR, name + ".json")
+        if os.path.exists(p):
+            with open(p) as f:
+                c = json.load(f)
+            roots = [os.path.realpath(os.path.expanduser(r)) for r in c.get("roots", [])]
+            if not roots or any(within(cwd, r) for r in roots):
+                found = p
+    cfg = {}
+    if found:
+        with open(found) as f:
+            cfg = json.load(f)
+    cfg["_config_path"] = found
+    p = cfg.setdefault("project", name)
+    if not p or sanitize(p) != p:
+        die(EX_CONFIG, "project name %r must be lowercase letters, digits, '-' or '_'" % p)
+    wd = (cfg.get("workdir") or (implied_workdir if implied_workdir not in (None, ".") else "")).strip("/")
+    if wd and (".." in wd.split("/") or not os.path.isdir(os.path.join(root, wd))):
+        die(EX_CONFIG, "workdir %r must be an existing directory inside %s" % (wd, root))
+    cfg["workdir"] = wd
+    return cfg
+
+
+# ---------------------------------------------------------------- ssh plumbing
+
+class Remote:
+    def __init__(self, h):
+        self.h = h
+        self.alias = h.get("ssh", h["name"])
+        self.home = None
+
+    def ssh_argv(self, timeout=15):
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % timeout, self.alias]
+
+    def sh(self, script, check=True, timeout=15, **kw):
+        full = "export PATH=%s:$PATH; %s" % (self.h.get("path_prefix", "/usr/local/bin"), script)
+        r = subprocess.run(self.ssh_argv(timeout) + [full], text=True, capture_output=True, **kw)
+        if r.returncode == 255 or (check and r.returncode):
+            raise RemoteError("remote command failed (%d): %s\n%s" % (
+                r.returncode, script[:160], r.stderr.strip()), r.returncode, r.stderr)
+        return r
+
+    @property
+    def root(self):
+        return self.home + "/" + self.h.get("root", "remote-run")
+
+    @property
+    def py(self):
+        return self.h.get("python", "python3")
+
+    def tool(self, *args):
+        return "%s %s/bin/rr_job.py %s" % (self.py, self.root, " ".join(shlex.quote(a) for a in args))
+
+    def _probe(self):
+        r = subprocess.run(self.ssh_argv(6) + [
+            'printf "%s\\n" "$HOME"; (ipconfig getifaddr en0 || hostname -I | cut -d" " -f1) 2>/dev/null'],
+            text=True, capture_output=True)
+        lines = r.stdout.split("\n")
+        if r.returncode == 0 and lines[0].startswith("/"):
+            self.home = lines[0].strip()
+            lan = lines[1].strip() if len(lines) > 1 else ""
+            if is_private_ip(lan) and lan != self._cached_lan_ip():
+                try:  # remember the host's own LAN address, so a DHCP change never breaks waking
+                    os.makedirs(STATE_DIR, exist_ok=True)
+                    with open(self._lan_ip_file(), "w") as f:
+                        f.write(lan + "\n")
+                except OSError:
+                    pass
+            return True
+        return False
+
+    def _lan_ip_file(self):
+        return os.path.join(STATE_DIR, "lan-ip." + sanitize(self.alias))
+
+    def _cached_lan_ip(self):
+        try:
+            with open(self._lan_ip_file()) as f:
+                return f.read().strip()
+        except OSError:
+            return ""
+
+    def wake_targets(self):
+        """LAN addresses to knock: the IP Tailscale sees for this host, the LAN IP the host last
+        reported about itself, the pinned wake_lan_ip, and optionally a wake_lan_host name."""
+        targets = []
+        ts_ip, ts = self.h.get("tailscale_ip"), shutil.which("tailscale")
+        if ts_ip and ts:
+            try:
+                peers = json.loads(run([ts, "status", "--json"]).stdout or "{}").get("Peer", {})
+            except ValueError:
+                peers = {}
+            for peer in peers.values():
+                if ts_ip in (peer.get("TailscaleIPs") or []):
+                    for addr in [peer.get("CurAddr")] + list(peer.get("Addrs") or []):
+                        ip = (addr or "").rsplit(":", 1)[0]
+                        if is_private_ip(ip):
+                            targets.append(ip)
+                            break
+        for t in (self._cached_lan_ip(), self.h.get("wake_lan_ip"), self.h.get("wake_lan_host")):
+            if t and t not in targets:
+                targets.append(t)
+        return targets
+
+    def reach(self):
+        """Connect, waking a sleeping host from the LAN if needed. Never falls back to local."""
+        if not self._probe():
+            targets = self.wake_targets()
+            if not targets:
+                die(EX_UNAVAILABLE, "UNAVAILABLE: %s is not reachable over ssh. %s" % (self.alias, NO_FALLBACK))
+            deadline = time.time() + float(self.h.get("wake_timeout_s", 90))
+            per_target = max(15.0, (deadline - time.time()) / len(targets))
+            woke = None
+            for target in targets:
+                say("%s unreachable; knocking %s:22 to wake it (its own Wi-Fi wake-on-network)..." % (self.alias, target))
+                until = min(deadline, time.time() + per_target)
+                while time.time() < until:
+                    try:
+                        socket.create_connection((target, 22), timeout=5).close()
+                    except OSError:
+                        pass
+                    if self._probe():
+                        woke = target
+                        break
+                    time.sleep(3)
+                if woke:
+                    break
+            if not woke:
+                die(EX_UNAVAILABLE, "UNAVAILABLE: %s did not wake (away from the home LAN, on battery, "
+                    "lid closed without a display, or offline). %s" % (self.alias, NO_FALLBACK))
+            say("woke %s via %s" % (self.alias, woke))
+            try:  # evidence of which wake path works, kept locally
+                os.makedirs(os.path.dirname(WAKE_LOG), exist_ok=True)
+                with open(WAKE_LOG, "a") as f:
+                    f.write("%s\t%s\t%s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S%z"), self.alias, woke))
+            except OSError:
+                pass
+        self.install_tool()
+        return self
+
+    def lease(self, seconds):
+        # Right after a network wake macOS re-sleeps within ~45 s; hold it for the upload/fetch.
+        self.sh("command -v caffeinate >/dev/null && (nohup caffeinate -i -s -t %d >/dev/null 2>&1 &) ; true"
+                % int(seconds), check=False)
+
+    def install_tool(self):
+        with open(RR_JOB, "rb") as f:
+            data = f.read()
+        digest = hashlib.sha256(data).hexdigest()
+        path = "%s/bin/rr_job.py" % self.root
+        r = self.sh("shasum -a 256 %s 2>/dev/null | cut -d' ' -f1" % shlex.quote(path), check=False)
+        if r.stdout.strip() != digest:
+            self.sh("mkdir -p %s/bin %s/jobs %s/cache && cat > %s.tmp && mv %s.tmp %s" % (
+                self.root, self.root, self.root, path, path, path), input=data.decode())
+
+    def jobdir(self, job_id):
+        if not job_id or sanitize(job_id) != job_id.lower() or "/" in job_id:
+            die(EX_USAGE, "bad job id %r" % job_id)
+        return "%s/jobs/%s" % (self.root, job_id)
+
+    def hostinfo(self):
+        return json.loads(self.sh(self.tool("hostinfo", self.root), timeout=30).stdout)
+
+    def status(self, job_id):
+        """Job status (wrapper-death aware). None when no such job; RemoteError on transport failure."""
+        r = self.sh(self.tool("status", self.jobdir(job_id)), check=False)
+        if r.returncode == 3:
+            return None
+        if r.returncode:
+            raise RemoteError("status failed: %s" % r.stderr.strip(), r.returncode, r.stderr)
+        return json.loads(r.stdout)
+
+    def job_json(self, job_id):
+        r = self.sh("cat %s/job.json" % self.jobdir(job_id), check=False)
+        if r.returncode:
+            die(EX_USAGE, "no job %s on %s" % (job_id, self.alias))
+        return json.loads(r.stdout)
+
+    def rsync(self, src, dst, extra=()):
+        cmd = ["rsync", "-a", "-e", "ssh -o BatchMode=yes -o ConnectTimeout=15"] + list(extra) + [src, dst]
+        r = run(cmd)
+        if r.returncode:
+            raise RemoteError("rsync failed (%d): %s" % (r.returncode, r.stderr.strip()), r.returncode, r.stderr)
+
+
+class RemoteLock:
+    """Exclusive flock held on the host for the life of one ssh session, kept alive by a
+    heartbeat so a laptop that vanishes mid-sync releases it within ~90 s."""
+
+    def __init__(self, remote, path):
+        self.remote, self.path = remote, path
+
+    def __enter__(self):
+        full = "export PATH=%s:$PATH; %s" % (self.remote.h.get("path_prefix", ""),
+                                            self.remote.tool("hold-lock", self.path))
+        self.p = subprocess.Popen(self.remote.ssh_argv() + [full], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
+        line = self.p.stdout.readline().strip()
+        if line == "WAITING":
+            say("waiting for the %s data-cache lock (another submit is syncing)..." % os.path.basename(self.path))
+            line = self.p.stdout.readline().strip()
+        if line != "LOCKED":
+            raise RemoteError("could not take data-cache lock %s" % self.path, self.p.poll() or 255)
+        self.stop = threading.Event()
+        self.beat = threading.Thread(target=self._heartbeat, daemon=True)
+        self.beat.start()
+        return self
+
+    def _heartbeat(self):
+        while not self.stop.wait(20):
+            try:
+                self.p.stdin.write(".")
+                self.p.stdin.flush()
+            except (OSError, ValueError):
+                return
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        try:
+            self.p.stdin.close()
+        except OSError:
+            pass
+        self.p.wait(timeout=60)
+
+
+# ---------------------------------------------------------------- snapshot
+
+def denied(path, extra_excludes=()):
+    parts = path.lower().split("/")
+    if any(p in DENY_DIRS for p in parts[:-1]):
+        return "deny-dir"
+    if any(fnmatch.fnmatchcase(p, g) for p in parts for g in DENY_GLOBS):
+        return "deny-pattern"
+    for ex in extra_excludes:
+        ex = ex.rstrip("/")
+        if path == ex or path.startswith(ex + "/") or fnmatch.fnmatch(path, ex):
+            return "config-exclude"
+    return None
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def wd_join(cfg, rel):
+    return os.path.normpath(os.path.join(cfg["workdir"], rel)) if cfg["workdir"] else rel.rstrip("/")
+
+
+def build_snapshot(root, cfg, out_path):
+    """Tar of tracked + untracked-not-ignored files as they are on disk now (uncommitted
+    changes included), minus filename and config excludes, plus meta/snapshot.json."""
+    data_paths = [wd_join(cfg, d) for d in cfg.get("data", [])]
+    scope = cfg["workdir"] if cfg.get("snapshot") == "workdir" and cfg["workdir"] else ""
+    listed = [f for f in git(root, "ls-files", "-co", "--exclude-standard", "-z").split("\0") if f]
+    keep, dropped = [], []
+    for f in sorted(set(listed)):
+        full = os.path.join(root, f)
+        if not os.path.lexists(full):
+            continue  # deleted in the working tree
+        if scope and not within(f, scope):
+            continue
+        if os.path.isdir(full) and not os.path.islink(full):
+            dropped.append([f, "submodule"])
+            continue
+        reason = denied(f, cfg.get("exclude", []) + data_paths)
+        if reason:
+            dropped.append([f, reason])
+        else:
+            keep.append(f)
+    manifest = []
+    for f in keep:
+        full = os.path.join(root, f)
+        if os.path.islink(full):
+            manifest.append([f, "symlink:" + os.readlink(full), 0])
+        else:
+            manifest.append([f, sha256_file(full), os.path.getsize(full)])
+    digest = hashlib.sha256("".join("%s\t%s\n" % (p, s) for p, s, _ in manifest).encode()).hexdigest()
+    try:
+        head = git(root, "rev-parse", "HEAD").strip()
+    except RuntimeError:
+        head = None
+    meta = {
+        "repo_root": root, "project": cfg["project"], "workdir": cfg["workdir"], "scope": scope or "repo",
+        "git_head": head,
+        "git_branch": git(root, "rev-parse", "--abbrev-ref", "HEAD").strip() if head else None,
+        "git_status_porcelain": git(root, "status", "--porcelain").splitlines(),
+        "snapshot_sha256": digest, "files": len(manifest), "bytes": sum(m[2] for m in manifest),
+        "excluded": dropped, "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "manifest": manifest,
+    }
+    limit_mb = float(cfg.get("max_snapshot_mb", 500))
+    if meta["bytes"] > limit_mb * 2**20:
+        biggest = sorted(manifest, key=lambda m: -m[2])[:10]
+        die(EX_CONFIG, "snapshot is %.0f MB (> %.0f MB). Add excludes or data paths to the project "
+            "config. Largest files:\n  %s" % (meta["bytes"] / 2**20, limit_mb,
+                                               "\n  ".join("%8.1f MB %s" % (m[2] / 2**20, m[0]) for m in biggest)))
+    with tarfile.open(out_path, "w:gz", compresslevel=1) as tar:
+        for f in keep:
+            tar.add(os.path.join(root, f), arcname="src/" + f, recursive=False)
+        blob = json.dumps(meta, indent=1, sort_keys=True).encode()
+        info = tarfile.TarInfo("meta/snapshot.json")
+        info.size, info.mtime = len(blob), int(time.time())
+        tar.addfile(info, io.BytesIO(blob))
+    return meta
+
+
+def read_snapshot_meta(tar_path):
+    with tarfile.open(tar_path, "r:gz") as tar:
+        return json.load(tar.extractfile("meta/snapshot.json"))
+
+
+def python_version(projdir):
+    """Exact Python patch version the laptop uses for this project (for UV_PYTHON)."""
+    py = os.path.join(projdir, ".venv", "bin", "python")
+    if not os.path.exists(py):
+        r = run(["uv", "python", "find"], cwd=projdir)
+        py = r.stdout.strip() if r.returncode == 0 else None
+    if py:
+        r = run([py, "-c", "import platform; print(platform.python_version())"])
+        if r.returncode == 0:
+            return r.stdout.strip()
+    return None
+
+
+def default_setup(projdir):
+    if os.path.exists(os.path.join(projdir, "uv.lock")):
+        return "uv sync --frozen"
+    if os.path.exists(os.path.join(projdir, "requirements.txt")):
+        return "python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt"
+    return ""
+
+
+def check_external(e):
+    if not os.path.isabs(e) or not os.path.exists(e):
+        die(EX_CONFIG, "external path %r must be an existing absolute path" % e)
+    real = os.path.realpath(e)
+    for p in (e, real):
+        if not within(p, HOME) or any(within(p, d) for d in DENY_EXTERNAL):
+            die(EX_CONFIG, "external path %r is outside $HOME or in a credential/cloud-synced "
+                "location; refusing" % e)
+        if denied(p[len(HOME) + 1:]):
+            die(EX_CONFIG, "external path %r looks like a credential; refusing" % e)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_submit(a):
+    if not a.command:
+        die(EX_USAGE, "no command. Usage: remote-run submit [opts] -- <command...>")
+    cwd = os.path.realpath(os.getcwd())
+    root = repo_root(a.root or cwd)
+    cfg = load_project(root, cwd, a.config)
+    h = host_config(a.host or cfg.get("host"))
+    base_data = [] if a.no_config_inputs else cfg.get("data", [])
+    base_ext = [] if a.no_config_inputs else cfg.get("external", [])
+    cfg["data"] = [d.strip("/") for d in base_data + (a.data or [])]
+    external = [e.rstrip("/") for e in base_ext + (a.external or [])]
+    for d in cfg["data"]:
+        full = os.path.join(root, wd_join(cfg, d))
+        if os.path.isabs(d) or ".." in d.split("/") or not os.path.exists(full):
+            die(EX_CONFIG, "data path %r must be an existing path relative to the workdir" % d)
+    data = [wd_join(cfg, d) for d in cfg["data"]]  # repo-root relative from here on
+    for e in external:
+        check_external(e)
+    projdir = os.path.join(root, cfg["workdir"])
+    rel_cwd = os.path.relpath(cwd, root) if within(cwd, root) else cfg["workdir"]
+    rel_cwd = "" if rel_cwd == "." else rel_cwd
+    if cfg.get("snapshot") == "workdir" and cfg["workdir"] and not within(rel_cwd, cfg["workdir"]):
+        rel_cwd = cfg["workdir"]
+
+    command = a.command[0] if len(a.command) == 1 else shlex.join(a.command)
+    env = {"PYTHONUNBUFFERED": "1", "REMOTE_RUN": "1"}
+    setup = a.setup if a.setup is not None else cfg.get("setup", default_setup(projdir))
+    if os.path.exists(os.path.join(projdir, "uv.lock")):
+        env["UV_FROZEN"] = "1"  # use the shipped lock as-is; never re-lock remotely
+        pyver = python_version(projdir)
+        if pyver:
+            env["UV_PYTHON"] = pyver  # same interpreter patch release as the laptop
+        else:
+            say("warning: could not determine the laptop's Python version; the host picks its own")
+    env.update(cfg.get("env", {}))
+    for kv in a.env or []:
+        k, _, v = kv.partition("=")
+        env[k] = v
+    use_git = bool(a.git or cfg.get("git"))
+
+    tmpdir = tempfile.mkdtemp(prefix="remote-run-")
+    try:
+        tar_path = a.snapshot or os.path.join(tmpdir, "snapshot.tar.gz")
+        meta = read_snapshot_meta(tar_path) if a.snapshot else build_snapshot(root, cfg, tar_path)
+        say("config %s | snapshot %s: %d files, %.1f MB, HEAD %s, %d uncommitted paths, %d excluded" % (
+            cfg["_config_path"] or "NONE", meta["snapshot_sha256"][:12], meta["files"],
+            meta["bytes"] / 2**20, (meta["git_head"] or "-")[:8], len(meta["git_status_porcelain"]),
+            len(meta["excluded"])))
+        if not cfg["_config_path"]:
+            say("warning: no project config for %r: no extra inputs, no worker pin "
+                "(see ~/.agents/skills/remote-run/ONBOARDING.md)" % cfg["project"])
+        if a.dry_run:
+            print(json.dumps({"host": h["name"], "config": cfg["_config_path"], "workdir": cfg["workdir"],
+                              "cwd": rel_cwd, "command": command, "env": env, "setup": setup,
+                              "git_history": use_git, "data": data, "external": external,
+                              "snapshot": {k: v for k, v in meta.items() if k != "manifest"}}, indent=1))
+            return 0
+        bundle = None
+        if use_git and meta["git_head"]:
+            bundle = os.path.join(tmpdir, "repo.bundle")
+            if run(["git", "-C", root, "bundle", "create", bundle, "HEAD"]).returncode:
+                die(EX_SOFTWARE, "git bundle failed")
+
+        rm = Remote(h).reach()
+        if not a.queue:
+            info = rm.hostinfo()
+            if info["busy"]:
+                hd = info.get("holder") or {}
+                die(EX_BUSY, "BUSY: %s is running job %s (%s) since %s. %s" % (
+                    rm.alias, hd.get("job_id"), (hd.get("command") or "")[:80], hd.get("since"), NO_FALLBACK))
+        rm.lease(int(h.get("lease_seconds", 900)))
+
+        job_id = "%s-%s-%s" % (cfg["project"], time.strftime("%Y%m%d-%H%M%S"), secrets.token_hex(2))
+        jobdir = rm.jobdir(job_id)
+        with open(tar_path, "rb") as f:
+            r = subprocess.run(rm.ssh_argv() + ["mkdir -p %s && tar -xzf - -C %s" % (jobdir, jobdir)],
+                               stdin=f, capture_output=True)
+        if r.returncode:
+            raise RemoteError("upload failed: %s" % r.stderr.decode(errors="replace").strip(), r.returncode)
+        if bundle:
+            with open(bundle, "rb") as f:
+                r = subprocess.run(rm.ssh_argv() + ["cat > %s/meta/repo.bundle" % jobdir], stdin=f,
+                                   capture_output=True)
+            if r.returncode:
+                raise RemoteError("bundle upload failed", r.returncode)
+            branch = meta.get("git_branch")
+            ref = ("git symbolic-ref HEAD refs/heads/%s && git update-ref HEAD FETCH_HEAD" % shlex.quote(branch)
+                   if branch and branch != "HEAD" else "git update-ref --no-deref HEAD FETCH_HEAD")
+            # History of HEAD with the snapshot as the working tree: code that records the commit
+            # or runs merge-base sees the laptop's commit, dirty exactly where the laptop was.
+            # Files the snapshot left out would show as deleted and mark every run "-dirty":
+            # skip-worktree them so `git status` reflects only the laptop's real changes.
+            rm.sh("cd %s/src && git init -q && git fetch -q ../meta/repo.bundle HEAD && %s && git reset -q"
+                  " && git ls-files --deleted -z | git update-index -z --skip-worktree --stdin"
+                  % (jobdir, ref), timeout=30)
+            say("git history of %s shipped (%.1f MB bundle)" % (meta["git_head"][:8], os.path.getsize(bundle) / 2**20))
+
+        if data or external:
+            cache = "%s/cache/%s" % (rm.root, cfg["project"])
+            excludes = []
+            for pat in sorted(DENY_DIRS) + DENY_GLOBS:
+                excludes += ["--exclude", pat]
+            with RemoteLock(rm, cache + ".lock"):
+                parents = {os.path.dirname("%s/%s" % (cache, d)) for d in data}
+                parents |= {os.path.dirname("%s/external%s" % (cache, e)) for e in external}
+                rm.sh("mkdir -p " + " ".join(shlex.quote(p) for p in sorted(parents)))
+                for d in data:
+                    src, t0 = os.path.join(root, d), time.time()
+                    if os.path.isdir(src):
+                        rm.rsync(src + "/", "%s:%s/%s/" % (rm.alias, cache, d), ["--delete"] + excludes)
+                    else:
+                        rm.rsync(src, "%s:%s/%s" % (rm.alias, cache, d))
+                    say("data %s synced (%.0f s)" % (d, time.time() - t0))
+                for e in external:
+                    t0 = time.time()
+                    if os.path.isdir(e):
+                        rm.rsync(e + "/", "%s:%s/external%s/" % (rm.alias, cache, e), ["-L"] + excludes)
+                    else:
+                        rm.rsync(os.path.realpath(e), "%s:%s/external%s" % (rm.alias, cache, e))
+                    say("external %s synced (%.0f s)" % (e, time.time() - t0))
+                # Each job gets its own copy-on-write view, frozen at submit time.
+                if data:
+                    rm.sh(rm.tool("clone-data", cache, jobdir + "/src", *data), timeout=60)
+                if external:
+                    rm.sh(rm.tool("clone-data", cache + "/external", jobdir + "/external",
+                                  *[e.lstrip("/") for e in external]), timeout=60)
+
+        env["GIT_CEILING_DIRECTORIES"] = rm.root + "/jobs"  # never pick up a repo above the job
+        env["REMOTE_RUN_JOB_ID"] = job_id
+        if meta["git_head"]:
+            env["REMOTE_RUN_GIT_HEAD"] = meta["git_head"]
+        job = {
+            "job_id": job_id, "project": cfg["project"], "label": a.label,
+            "submitted": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "submitted_from": socket.gethostname(),
+            "repo_root": root, "workdir": cfg["workdir"], "rel_cwd": rel_cwd,
+            "config": cfg["_config_path"], "command": command, "setup": setup, "env": env,
+            "data": data, "external": external, "fetch": cfg.get("fetch", []),
+            "remote_root": rm.root, "path_prefix": h.get("path_prefix", "") + ":" + rm.home + "/.local/bin",
+            "mem_limit_gb": a.mem_limit_gb if a.mem_limit_gb is not None else cfg.get(
+                "mem_limit_gb", h.get("mem_limit_gb")),
+            "swap_growth_kill_gb": h.get("swap_growth_kill_gb"), "min_free_pct": h.get("min_free_pct"),
+            "swap_growth_free_pct": h.get("swap_growth_free_pct"),
+            "grace_seconds": int(h.get("grace_seconds", 600)),
+            "snapshot_sha256": meta["snapshot_sha256"], "git_head": meta["git_head"], "git_history": bool(bundle),
+        }
+        rm.sh("cat > %s/job.json && cp %s/bin/rr_job.py %s/" % (jobdir, rm.root, jobdir),
+              input=json.dumps(job, indent=1, sort_keys=True))
+        launch = "%s %s/rr_job.py run %s%s >> %s/wrapper.log 2>&1" % (
+            rm.py, jobdir, jobdir, " --queue" if a.queue else "", jobdir)
+        rm.sh("tmux new-session -d -s rr-%s -c %s %s" % (job_id, jobdir, shlex.quote(launch)))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    deadline, st = time.time() + 60, None
+    while time.time() < deadline:
+        try:
+            st = rm.status(job_id)
+        except RemoteError:
+            st = None
+        if st and st.get("state") != "starting":
+            break
+        time.sleep(1.5)
+    state = (st or {}).get("state")
+    if state in (None, "starting"):
+        die(EX_SOFTWARE, "job %s was launched but its state could not be confirmed within 60 s; it may be "
+            "running. Check `remote-run status %s`; do not re-submit it or run it locally." % (job_id, job_id))
+    if state == "busy":
+        hd = st.get("holder") or {}
+        die(EX_BUSY, "BUSY: lost the race; %s holds %s. Job %s was not run. %s" % (
+            hd.get("job_id"), rm.alias, job_id, NO_FALLBACK))
+    print(job_id)
+    say("%s on %s (%s). Next: remote-run wait %s   |   remote-run logs %s   |   remote-run fetch %s" % (
+        state.upper(), st.get("host"), jobdir, job_id, job_id, job_id))
+    if a.wait:
+        return wait_for(rm, job_id, a.timeout, a.interval)
+    if state in {"setup_failed", "failed", "error"}:
+        return EXIT_FOR_STATE.get(state, 1)
+    return 0
+
+
+def fmt(v, unit=""):
+    return "-" if v is None else "%s%s" % (v, unit)
+
+
+def summary_line(job_id, st):
+    extra = " kill_reason=%r" % st["kill_reason"] if st.get("kill_reason") else ""
+    extra += " (%s)" % st["lost_detail"] if st.get("lost_detail") else ""
+    return "%s %s exit=%s elapsed=%s peak_tree_rss=%s largest_proc=%s host=%s%s" % (
+        job_id, st.get("state"), fmt(st.get("exit_code")), fmt(st.get("elapsed_s"), "s"),
+        fmt(st.get("peak_tree_rss_gb"), "GB"), fmt(st.get("largest_single_proc_rss_gb"), "GB"),
+        st.get("host"), extra)
+
+
+def exit_code_for(st):
+    state = st.get("state")
+    if state in EXIT_FOR_STATE:
+        return EXIT_FOR_STATE[state]
+    rc = st.get("exit_code")
+    if isinstance(rc, int) and rc < 0:
+        return 128 - rc  # killed by signal -rc
+    return rc or 1
+
+
+def wait_for(rm, job_id, timeout, interval):
+    rm.job_json(job_id)  # fail fast on an unknown job id
+    t0, last_state, last_beat = time.time(), None, time.time()
+    while True:
+        try:
+            st = rm.status(job_id)
+        except RemoteError:
+            st = False  # transport trouble: try to reach/wake the host, keep polling
+            try:
+                rm.reach()
+            except SystemExit:
+                pass
+        if st is None:
+            die(EX_USAGE, "job %s disappeared from %s" % (job_id, rm.alias))
+        if st:
+            state = st.get("state")
+            if state != last_state or time.time() - last_beat > 600:
+                say("%s %s elapsed=%s tree_rss=%s peak=%s" % (
+                    job_id, state, fmt(st.get("elapsed_s"), "s"), fmt(st.get("tree_rss_gb"), "GB"),
+                    fmt(st.get("peak_tree_rss_gb"), "GB")))
+                last_state, last_beat = state, time.time()
+            if state not in ACTIVE:
+                print(summary_line(job_id, st))
+                return exit_code_for(st)
+        if timeout and time.time() - t0 > timeout:
+            say("timed out after %ds; job %s is still %s (it keeps running)" % (timeout, job_id, last_state))
+            return EX_TIMEOUT
+        time.sleep(interval)
+
+
+def remote_for(a):
+    return Remote(host_config(a.host)).reach()
+
+
+def cmd_wait(a):
+    return wait_for(remote_for(a), a.job, a.timeout, a.interval)
+
+
+def cmd_status(a):
+    rm = remote_for(a)
+    st = rm.status(a.job)
+    if st is None:
+        die(EX_USAGE, "no job %s on %s" % (a.job, rm.alias))
+    print(json.dumps(st, indent=1, sort_keys=True) if a.json else summary_line(a.job, st))
+    return 0
+
+
+def cmd_logs(a):
+    rm = remote_for(a)
+    path = "%s/%s" % (rm.jobdir(a.job), "setup.log" if a.setup else "run.log")
+    if a.follow:
+        return subprocess.call(rm.ssh_argv() + ["tail -n %d -f %s" % (a.n, path)])
+    r = rm.sh("tail -n %d %s" % (a.n, path), check=False)
+    sys.stdout.write(r.stdout)
+    return 0 if r.returncode == 0 else 1
+
+
+def cmd_fetch(a):
+    rm = remote_for(a)
+    job = rm.job_json(a.job)
+    st = rm.status(a.job) or {}
+    if st.get("state") in ACTIVE and not a.partial:
+        die(1, "job %s is still %s; results would be partial. Run `remote-run wait %s` first "
+            "(or pass --partial)." % (a.job, st.get("state"), a.job))
+    rm.lease(300)
+    dest = os.path.abspath(a.dest or os.path.join(RESULTS_DIR, job["project"], a.job))
+    jobdir = rm.jobdir(a.job)
+
+    def pull(remote_path, local_rel, required=False):
+        # openrsync ignores the -R "/./" anchor, so recreate each parent dir locally instead.
+        parent = os.path.dirname(os.path.join(dest, local_rel))
+        os.makedirs(parent, exist_ok=True)
+        try:
+            rm.rsync("%s:%s" % (rm.alias, remote_path), parent + "/")
+            return True
+        except RemoteError as e:
+            if e.rc == 23 and "No such file" in e.stderr and not required:
+                return False
+            raise
+
+    for f in ["job.json", "status.json", "exit_code", "run.log", "setup.log", "mem.tsv",
+              "wrapper.log", "meta/snapshot.json"]:
+        pull("%s/%s" % (jobdir, f), f, required=f in ("job.json", "status.json"))
+    missing, base = [], "src/" + (job.get("workdir") + "/" if job.get("workdir") else "")
+    for p in a.paths or job.get("fetch", []):
+        if p.startswith("/"):
+            if ".." in p.split("/"):
+                die(EX_USAGE, "bad fetch path %r" % p)
+            ok = pull(p.rstrip("/"), "abs" + p.rstrip("/"))  # host absolute path, e.g. run artifacts
+        else:
+            p = p.strip("/")
+            if not p or ".." in p.split("/"):
+                die(EX_USAGE, "fetch path %r must be relative to the job's workdir or absolute" % p)
+            ok = pull("%s/%s%s" % (jobdir, base, p), base + p)
+        if not ok:
+            missing.append(p)
+    if missing:
+        say("not present in the job (skipped): %s" % ", ".join(missing))
+    print(dest)
+    return 0
+
+
+def cmd_cancel(a):
+    rm = remote_for(a)
+    r = rm.sh(rm.tool("cancel", rm.jobdir(a.job)), check=False, timeout=15)
+    if r.returncode == 3:
+        die(EX_USAGE, "no job %s" % a.job)
+    st = json.loads(r.stdout or "{}")
+    print(summary_line(a.job, st))
+    return 0 if st.get("state") not in ACTIVE else EX_SOFTWARE
+
+
+def cmd_host(a):
+    rm = remote_for(a)
+    info = rm.hostinfo()
+    if a.json:
+        print(json.dumps(info, indent=1, sort_keys=True))
+        return 0
+    m, p = info["memory"], info.get("power", {})
+    print("host %s (%s, %s cpus) via %s" % (info["hostname"], info["platform"], info["cpus"], rm.alias))
+    hd = info["holder"] or {}
+    print("lock: %s" % ("BUSY by %s since %s" % (hd.get("job_id"), hd.get("since")) if info["busy"] else "free"))
+    for j in info["active_jobs"]:
+        print("  %-10s %s  %s" % (j["state"], j["job_id"], (j["command"] or "")[:70]))
+    print("memory: %s GB total, %s%% free, swap used %s GB; disk free %s GB" % (
+        m.get("total_gb"), m.get("free_pct"), m.get("swap_used_gb"), info["disk_free_gb"]))
+    print("wake targets (in order): %s" % (", ".join(rm.wake_targets()) or "none"))
+    if p:
+        print("power: %s, lid %s" % ("AC" if p.get("on_ac") else "BATTERY (network wake off)",
+                                     "closed (needs an external display to stay awake)" if p.get("lid_closed") else "open"))
+    return 0
+
+
+def cmd_list(a):
+    rm = remote_for(a)
+    for line in rm.sh(rm.tool("list", rm.root, str(a.n))).stdout.splitlines():
+        j = json.loads(line)
+        print("%-44s %-12s exit=%-4s %7ss peak=%sGB %s" % (
+            j["job_id"], j["state"], fmt(j.get("exit_code")), fmt(j.get("elapsed_s")),
+            fmt(j.get("peak_tree_rss_gb")), (j.get("command") or "")[:60]))
+    return 0
+
+
+def cmd_snapshot(a):
+    cwd = os.path.realpath(os.getcwd())
+    root = repo_root(a.root or cwd)
+    cfg = load_project(root, cwd, a.config)
+    meta = build_snapshot(root, cfg, a.output)
+    print(json.dumps({k: v for k, v in meta.items() if k != "manifest"}, indent=1))
+    if a.extract:
+        dest = os.path.abspath(a.extract)
+        os.makedirs(dest, exist_ok=True)
+        with tarfile.open(a.output, "r:gz") as tar:
+            if hasattr(tarfile, "tar_filter"):
+                tar.extractall(dest, filter="tar")
+            else:
+                tar.extractall(dest)
+        for d in cfg.get("data", []):
+            rel = wd_join(cfg, d)
+            target = os.path.join(dest, "src", rel)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            subprocess.run(["cp", "-Rc" if sys.platform == "darwin" else "-R", os.path.join(root, rel), target],
+                           check=True)
+        say("extracted to %s/src (data cloned; external inputs are used in place)" % dest)
+    return 0
+
+
+def cmd_clean(a):
+    rm = remote_for(a)
+    sys.stdout.write(rm.sh(rm.tool("clean", rm.root, str(a.days), *a.jobs), timeout=120).stdout)
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="remote-run", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--host", help="host name from hosts.json (default: $REMOTE_RUN_HOST or hosts.json default)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("submit", help="ship a snapshot and run a command remotely")
+    s.add_argument("--root", help="repo to snapshot (default: git toplevel of cwd)")
+    s.add_argument("--config", help="project config JSON (default: nearest .remote-run.json, then "
+                                    "<tool>/projects/*.json by roots or repo name)")
+    s.add_argument("--data", action="append", help="extra workdir-relative input path (repeatable)")
+    s.add_argument("--external", action="append", help="extra absolute input path (repeatable)")
+    s.add_argument("--no-config-inputs", action="store_true", help="ignore the config's data/external lists")
+    s.add_argument("--env", action="append", metavar="K=V", help="extra environment variable (repeatable)")
+    s.add_argument("--setup", help="environment setup command (default: uv sync --frozen when uv.lock exists)")
+    s.add_argument("--git", action="store_true", help="ship HEAD's git history so the job can run git")
+    s.add_argument("--label", help="free-text label shown in host/list output")
+    s.add_argument("--queue", action="store_true", help="if the host is busy, wait remotely for the lock instead of exiting 75")
+    s.add_argument("--wait", action="store_true", help="block until the job ends (exit with its exit code)")
+    s.add_argument("--timeout", type=int, default=0, help="with --wait: give up waiting after N seconds")
+    s.add_argument("--interval", type=int, default=20, help="with --wait: poll interval seconds")
+    s.add_argument("--mem-limit-gb", type=float, help="kill the job tree above this RSS (default from config/host)")
+    s.add_argument("--snapshot", help="use a tarball made by `remote-run snapshot` instead of building one")
+    s.add_argument("--dry-run", action="store_true", help="build the snapshot and print the plan; no remote action")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_submit)
+
+    for name, fn in (("wait", cmd_wait), ("status", cmd_status), ("logs", cmd_logs),
+                     ("fetch", cmd_fetch), ("cancel", cmd_cancel)):
+        s = sub.add_parser(name)
+        s.add_argument("job")
+        s.set_defaults(fn=fn)
+        if name == "wait":
+            s.add_argument("--timeout", type=int, default=0)
+            s.add_argument("--interval", type=int, default=20)
+        if name == "status":
+            s.add_argument("--json", action="store_true")
+        if name == "logs":
+            s.add_argument("-n", type=int, default=40)
+            s.add_argument("--setup", action="store_true", help="show setup.log instead of run.log")
+            s.add_argument("-f", "--follow", action="store_true")
+        if name == "fetch":
+            s.add_argument("paths", nargs="*", help="workdir-relative or absolute host paths (default: config fetch list)")
+            s.add_argument("--dest", help="local destination (default: %s/<project>/<job>)" % RESULTS_DIR)
+            s.add_argument("--partial", action="store_true", help="fetch even though the job is still running")
+
+    s = sub.add_parser("host")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_host)
+    s = sub.add_parser("list")
+    s.add_argument("-n", type=int, default=15)
+    s.set_defaults(fn=cmd_list)
+    s = sub.add_parser("snapshot")
+    s.add_argument("-o", "--output", required=True)
+    s.add_argument("--extract", help="also extract into DIR (src/ + meta/) with data cloned, for a local reference run")
+    s.add_argument("--root")
+    s.add_argument("--config")
+    s.set_defaults(fn=cmd_snapshot)
+    s = sub.add_parser("clean")
+    s.add_argument("--days", type=float, default=7)
+    s.add_argument("jobs", nargs="*")
+    s.set_defaults(fn=cmd_clean)
+
+    a = p.parse_args()
+    if getattr(a, "command", None) and a.command[:1] == ["--"]:
+        a.command = a.command[1:]
+    try:
+        return a.fn(a)
+    except RemoteError as e:
+        code = EX_UNAVAILABLE if e.rc == 255 else EX_SOFTWARE
+        die(code, "%s%s" % (e, (" " + NO_FALLBACK) if a.cmd == "submit" else ""))
+    except RuntimeError as e:
+        die(EX_SOFTWARE, "%s%s" % (e, (" " + NO_FALLBACK) if a.cmd == "submit" else ""))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

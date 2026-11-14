@@ -1,0 +1,9 @@
+# Session planning notes (plan-files): private infra details, not part of the tool.
+.planning/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Personal host and project configuration stays local.
+hosts.local.json
+projects/*.local.json

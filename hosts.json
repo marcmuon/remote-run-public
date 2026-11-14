@@ -1,0 +1,19 @@
+{
+  "default": "worker",
+  "hosts": {
+    "worker": {
+      "ssh": "remote-worker",
+      "description": "Example macOS execution host with 16 GB RAM. Set limits for your host.",
+      "wake_timeout_s": 90,
+      "path_prefix": "/opt/homebrew/bin:/usr/local/bin",
+      "python": "/opt/homebrew/bin/python3",
+      "root": "remote-run",
+      "lease_seconds": 900,
+      "grace_seconds": 600,
+      "mem_limit_gb": 8,
+      "swap_growth_kill_gb": 1.5,
+      "min_free_pct": 20,
+      "swap_growth_free_pct": 25
+    }
+  }
+}

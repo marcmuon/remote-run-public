@@ -1,0 +1,15 @@
+{
+  "project": "simulation",
+  "data": [
+    "data/input"
+  ],
+  "env": {
+    "SIM_WORKERS": "1"
+  },
+  "fetch": [
+    "output"
+  ],
+  "notes": [
+    "Create data/input before submitting. Replace SIM_WORKERS with the worker setting your command reads."
+  ]
+}
